@@ -1,0 +1,1661 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math' as math;
+import 'dart:math';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:flutter_ros/animation/rotating_image.dart';
+import 'package:flutter_ros/model/location.dart';
+import 'package:flutter_ros/services/ros/ros_services.dart';
+import 'package:flutter_ros/services/service_locator.dart';
+import 'package:flutter_ros/widgets/left/external_manager.dart';
+import 'package:flutter_ros/widgets/left/getroute_manager.dart';
+import 'package:flutter_ros/widgets/left/interactive_compass.dart';
+import 'package:flutter_ros/widgets/left/internal_manager.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:latlong2/latlong.dart';
+import 'package:lucide_icons/lucide_icons.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+class NavigationWidget extends StatefulWidget {
+  final double destinationLat;
+  final double destinationLng;
+  final Function(bool) onMinimizedChanged;
+  const NavigationWidget({
+    super.key,
+    required this.destinationLat,
+    required this.destinationLng,
+    required this.onMinimizedChanged,
+  });
+
+  @override
+  _NavigationWidgetState createState() => _NavigationWidgetState();
+}
+
+class _NavigationWidgetState extends State<NavigationWidget> {
+  final InternalRouteManager _internalRouteManager = InternalRouteManager();
+  final ExternalRouteManager _externalRouteManager = ExternalRouteManager();
+  final MapController _mapController = MapController();
+  final LocationService _locationService = LocationService();
+  final GeoJsonRouteManager _geoJsonRouteManager = GeoJsonRouteManager();
+  final RosService rosService = RosService();
+  bool _isLoading = false;
+  bool _isMinimized = false;
+  bool _isMinBuildInfo = false;
+  LatLng? _currentPosition;
+  LatLng? _destinationLocation;
+  List<LatLng> _polylinePoints = [];
+  double? _estimatedDistance;
+  String? _estimatedTime;
+  String? _address;
+  List<Location> _geoJsonLocations = [];
+  List<LatLng> lineStringPoints = [];
+  final List<LatLng> _lineStringPoints = [];
+
+  double _rotation = 0.0;
+  Offset? _startOffset; // Starting point of the touch gesture
+  double _startRotation = 0.0; // Rotation angle when the gesture starts
+
+  Timer? _locationUpdateTimer;
+  LatLng? _lastPosition; // Menyimpan posisi terakhir
+
+  @override
+  void initState() {
+    super.initState();
+    _loadGeoJsonData();
+    _geoJsonLocations = _parseGeoJson(geoJsonData);
+
+    // Mendengarkan stream latitude dan longitude
+    rosService.latitudeStream.listen((lat) {
+      if (_currentPosition != null) {
+        setState(() {
+          _currentPosition = LatLng(lat, _currentPosition!.longitude);
+        });
+      }
+    });
+
+    rosService.longitudeStream.listen((lon) {
+      if (_currentPosition != null) {
+        setState(() {
+          _currentPosition = LatLng(_currentPosition!.latitude, lon);
+        });
+      }
+    });
+
+    // Memulai timer untuk pembaruan lokasi setiap 5 detik
+    _locationUpdateTimer = Timer.periodic(const Duration(seconds: 5), (timer) {
+      _updateLocation();
+    });
+  }
+
+  @override
+  void dispose() {
+    _locationUpdateTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _loadGeoJsonData() async {
+    try {
+      String geoJsonString = geoJsonData;
+      await _geoJsonRouteManager.loadGeoJsonData(geoJsonString);
+      setState(() {
+        _geoJsonLocations = _parseGeoJson(geoJsonString);
+
+        final Map<String, dynamic> data = jsonDecode(geoJsonString);
+        for (var feature in data['features']) {
+          if (feature['geometry']['type'] == 'LineString') {
+            List<dynamic> coordinates = feature['geometry']['coordinates'];
+            _lineStringPoints.addAll(
+              coordinates.map((coord) => LatLng(coord[1], coord[0])).toList(),
+            );
+          }
+        }
+      });
+    } catch (e) {
+      print('Error loading GeoJSON data: $e');
+    }
+  }
+
+  Future<void> _getRouteFromGeoJson(LatLng destination) async {
+    if (_lineStringPoints.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("No route data available")),
+      );
+      return;
+    }
+
+    if (_currentPosition == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Current location not available")),
+      );
+      return;
+    }
+
+    LatLng startPoint = _findClosestPoint(_currentPosition!, _lineStringPoints);
+    LatLng endPoint = _findClosestPoint(destination, _lineStringPoints);
+
+    await _getRoute(startPoint, endPoint);
+  }
+
+  LatLng _findClosestPoint(LatLng point, List<LatLng> linePoints) {
+    double minDistance = double.infinity;
+    LatLng closestPoint = linePoints.first;
+
+    for (var linePoint in linePoints) {
+      double distance = _calculateDistance(point, linePoint);
+      if (distance < minDistance) {
+        minDistance = distance;
+        closestPoint = linePoint;
+      }
+    }
+
+    return closestPoint;
+  }
+
+  Future<void> _getRoute(LatLng start, LatLng end) async {
+    _setLoadingState(true);
+    try {
+      List<LatLng> routePoints = await _fetchRoutePoints(start, end);
+
+      if (routePoints.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("No route found")),
+        );
+        return;
+      }
+
+      // Create a route that follows the LineString points between start and end
+      List<LatLng> fullRoute = _createRouteAlongLineString(start, end);
+      _updateRouteInfo(fullRoute);
+      _fitMapBounds();
+    } catch (e) {
+      _handleError(e);
+    } finally {
+      _setLoadingState(false);
+    }
+  }
+
+  List<LatLng> _createRouteAlongLineString(LatLng start, LatLng end) {
+    List<LatLng> route = [];
+    int startIndex = -1;
+    int endIndex = -1;
+
+    for (int i = 0; i < _lineStringPoints.length; i++) {
+      if (_calculateDistance(_lineStringPoints[i], start) < 0.0001) {
+        startIndex = i;
+      }
+      if (_calculateDistance(_lineStringPoints[i], end) < 0.0001) {
+        endIndex = i;
+      }
+    }
+
+    if (startIndex != -1 && endIndex != -1) {
+      if (startIndex <= endIndex) {
+        route.addAll(_lineStringPoints.sublist(startIndex, endIndex + 1));
+      } else {
+        route.addAll(
+            _lineStringPoints.sublist(endIndex, startIndex + 1).reversed);
+      }
+    }
+
+    return route;
+  }
+
+  Future<List<LatLng>> _fetchRoutePoints(LatLng start, LatLng end) async {
+    if (_internalRouteManager.isPointOnInternalRoad(start) &&
+        _internalRouteManager.isPointOnInternalRoad(end)) {
+      return _internalRouteManager.getInternalRoute();
+    } else {
+      return await _externalRouteManager.getExternalRoute(start, end);
+    }
+  }
+
+  Future<String> _getDestinationName(LatLng destination) async {
+    for (var location in _geoJsonLocations) {
+      if (location.latitude == destination.latitude &&
+          location.longitude == destination.longitude) {
+        return location.name; // Return the name if found in GeoJSON
+      }
+    }
+
+    try {
+      // Create a string representation of the coordinates
+      String coordinates = '${destination.latitude}, ${destination.longitude}';
+
+      // Fetch locations from Mapbox using the coordinates
+      final results =
+          await _locationService.fetchLocationsFromMapbox(coordinates);
+
+      // Assuming results is a List<Location>, return the name of the first result
+      if (results.isNotEmpty) {
+        return results
+            .first.name; // Return the name of the first location found
+      }
+    } catch (e) {
+      print('Error fetching location from Mapbox: $e');
+    }
+
+    // Fallback if no address found
+    return "Unknown Location";
+  }
+
+  void _showDestinationInfoDialog(BuildContext context) async {
+    if (_destinationLocation != null) {
+      String destinationName = await _getDestinationName(_destinationLocation!);
+
+      showDialog(
+        context: context,
+        builder: (BuildContext context) {
+          return AlertDialog(
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(15),
+            ),
+            title: const Row(
+              children: [
+                Icon(
+                  LucideIcons.mapPin,
+                  color: Colors.blueAccent,
+                  size: 24,
+                ),
+                SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'Destination Info',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.black87,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  destinationName,
+                  style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.black87,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Icon(
+                      LucideIcons.compass,
+                      color: Colors.grey,
+                      size: 18,
+                    ),
+                    const SizedBox(width: 5),
+                    Text(
+                      'Latitude: ${_destinationLocation!.latitude.toStringAsFixed(6)}',
+                      style: const TextStyle(
+                        fontSize: 14,
+                        color: Colors.black54,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Icon(
+                      LucideIcons.compass,
+                      color: Colors.grey,
+                      size: 18,
+                    ),
+                    const SizedBox(width: 5),
+                    Text(
+                      'Longitude: ${_destinationLocation!.longitude.toStringAsFixed(6)}',
+                      style: const TextStyle(
+                        fontSize: 14,
+                        color: Colors.black54,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            actions: [
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Center(
+                  child: ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.blueAccent,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 30, vertical: 12),
+                    ),
+                    onPressed: () {
+                      Navigator.of(context).pop(); // Close the dialog
+                    },
+                    child: const Text(
+                      'OK',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      );
+    }
+  }
+
+  void _updateRouteInfo(List<LatLng> routePoints) {
+    double totalDistance = _calculateTotalDistance(routePoints);
+    String formattedTime = _formatTravelTime(totalDistance / 30);
+
+    setState(() {
+      _polylinePoints = routePoints;
+      _estimatedDistance = totalDistance;
+      _estimatedTime = formattedTime;
+    });
+  }
+
+  void _setLoadingState(bool isLoading) {
+    setState(() {
+      _isLoading = isLoading;
+    });
+  }
+
+  void _handleError(dynamic error) {
+    print('Error fetching route: $error');
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text("Error fetching route: $error")),
+    );
+  }
+
+  double _calculateTotalDistance(List<LatLng> points) {
+    double total = 0;
+    for (int i = 0; i < points.length - 1; i++) {
+      total += _calculateDistance(points[i], points[i + 1]);
+    }
+    return total;
+  }
+
+  double _calculateDistance(LatLng start, LatLng end) {
+    const double earthRadius = 6371; // Radius of the Earth in km
+    final double dLat = _degreesToRadians(end.latitude - start.latitude);
+    final double dLng = _degreesToRadians(end.longitude - start.longitude);
+
+    final double a = math.sin(dLat / 2) * math.sin(dLat / 2) +
+        math.cos(_degreesToRadians(start.latitude)) *
+            math.cos(_degreesToRadians(end.latitude)) *
+            math.sin(dLng / 2) *
+            math.sin(dLng / 2);
+    final double c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+
+    return earthRadius * c;
+  }
+
+  double _degreesToRadians(double degrees) {
+    return degrees * math.pi / 180;
+  }
+
+  String _formatTravelTime(double hours) {
+    int totalMinutes = (hours * 60).toInt();
+    int hoursPart = totalMinutes ~/ 60;
+    int minutesPart = totalMinutes % 60;
+
+    if (hoursPart > 0) {
+      return '$hoursPart hour${hoursPart > 1 ? 's' : ''} and $minutesPart minute${minutesPart > 1 ? 's' : ''}';
+    } else {
+      return '$minutesPart minute${minutesPart > 1 ? 's' : ''}';
+    }
+  }
+
+  void _fitMapBounds() {
+    if (_polylinePoints.isNotEmpty) {
+      double minLat =
+          _polylinePoints.map((point) => point.latitude).reduce(math.min);
+      double maxLat =
+          _polylinePoints.map((point) => point.latitude).reduce(math.max);
+      double minLng =
+          _polylinePoints.map((point) => point.longitude).reduce(math.min);
+      double maxLng =
+          _polylinePoints.map((point) => point.longitude).reduce(math.max);
+
+      LatLng center = LatLng((minLat + maxLat) / 2, (minLng + maxLng) / 2);
+
+      _mapController.move(
+          center, _calculateZoom(minLat, maxLat, minLng, maxLng));
+    }
+  }
+
+  double _calculateZoom(
+      double minLat, double maxLat, double minLng, double maxLng) {
+    double latDiff = maxLat - minLat;
+    double lngDiff = maxLng - minLng;
+
+    double maxDiff = math.max(latDiff, lngDiff);
+
+    if (maxDiff < 0.05) {
+      return 14.0;
+    } else if (maxDiff < 0.1) {
+      return 12.0;
+    } else if (maxDiff < 0.5) {
+      return 10.0;
+    } else if (maxDiff < 1.0) {
+      return 8.0;
+    } else {
+      return 6.0;
+    }
+  }
+
+  String get geoJsonData {
+    return '''
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Pos Satpam [Gerbang Keluar]"
+      },
+      "geometry": {
+        "coordinates": [
+          107.61128566453931,
+          -6.88282548140144
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "BRIN SAMAUN SAMADIKUN"
+      },
+      "geometry": {
+        "coordinates": [
+          [
+            [
+              107.61059030528935,
+              -6.8814935273577476
+            ],
+            [
+              107.61055435697352,
+              -6.881603186397982
+            ],
+            [
+              107.61055451863717,
+              -6.881871606483273
+            ],
+            [
+              107.61055108500608,
+              -6.882064492366339
+            ],
+            [
+              107.61055068686835,
+              -6.882161503422651
+            ],
+            [
+              107.6105488208533,
+              -6.882288093250807
+            ],
+            [
+              107.61054899498782,
+              -6.882641877907943
+            ],
+            [
+              107.61054337861202,
+              -6.882966719935041
+            ],
+            [
+              107.61065387579367,
+              -6.883064785040602
+            ],
+            [
+              107.6112307709115,
+              -6.883859107907554
+            ],
+            [
+              107.61130400555125,
+              -6.88379508785544
+            ],
+            [
+              107.61130355569256,
+              -6.883687519044772
+            ],
+            [
+              107.61130470454935,
+              -6.883418188877005
+            ],
+            [
+              107.61131247986157,
+              -6.882970704690244
+            ],
+            [
+              107.6116555070854,
+              -6.882911437112153
+            ],
+            [
+              107.61167139149609,
+              -6.882843471681554
+            ],
+            [
+              107.61178469385442,
+              -6.881362406101928
+            ],
+            [
+              107.61176581012876,
+              -6.881306163013818
+            ],
+            [
+              107.61118390448291,
+              -6.88115936112105
+            ],
+            [
+              107.61059607746279,
+              -6.881047831547335
+            ],
+            [
+              107.6106013332647,
+              -6.881315504714415
+            ],
+            [
+              107.61059030528935,
+              -6.8814935273577476
+            ]
+          ]
+        ],
+        "type": "Polygon"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name ": "Pintu Masuk BRIN"
+      },
+      "geometry": {
+        "coordinates": [
+          107.61072494225465,
+          -6.88271812809009
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Masjid BRIN"
+      },
+      "geometry": {
+        "coordinates": [
+          107.61110687079912,
+          -6.8821714086871
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Gedung 10  BRIN"
+      },
+      "geometry": {
+        "coordinates": [
+          107.61113943761342,
+          -6.881834852334364
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Workshop BRIN"
+      },
+      "geometry": {
+        "coordinates": [
+          107.61118532823122,
+          -6.881442448253523
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "LAB T1 BRIN [Autonomous]"
+      },
+      "geometry": {
+        "coordinates": [
+          107.6114443882891,
+          -6.881302828718674
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Parkiran Belakang BRIN"
+      },
+      "geometry": {
+        "coordinates": [
+          107.61171946760282,
+          -6.8817100808617795
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Mini GYM BRIN"
+      },
+      "geometry": {
+        "coordinates": [
+          107.61165433313164,
+          -6.882293541370245
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {},
+      "geometry": {
+        "coordinates": [
+          [
+            107.61060294280838,
+            -6.882948304564081
+          ],
+          [
+            107.6107238262602,
+            -6.882723450496144
+          ],
+          [
+            107.61073956270013,
+            -6.882473481879586
+          ],
+          [
+            107.61078991930293,
+            -6.882420363530542
+          ],
+          [
+            107.61097560928113,
+            -6.882426612748503
+          ],
+          [
+            107.61103540774809,
+            -6.882429737358095
+          ],
+          [
+            107.61107002791374,
+            -6.882404740486081
+          ],
+          [
+            107.61109205892802,
+            -6.882370369785548
+          ],
+          [
+            107.61111094265374,
+            -6.882111027150813
+          ],
+          [
+            107.61113926824362,
+            -6.881823562858358
+          ],
+          [
+            107.61118018298498,
+            -6.8814923537838695
+          ],
+          [
+            107.61119906671212,
+            -6.881304876846926
+          ],
+          [
+            107.61124312874057,
+            -6.881279879917059
+          ],
+          [
+            107.61146658617014,
+            -6.881304876846926
+          ],
+          [
+            107.61171836919101,
+            -6.881342372239999
+          ],
+          [
+            107.61174040020529,
+            -6.881386116861705
+          ],
+          [
+            107.61172151647821,
+            -6.881701702942607
+          ],
+          [
+            107.61165857072399,
+            -6.882282880719529
+          ],
+          [
+            107.6116145086956,
+            -6.88277344420392
+          ],
+          [
+            107.6115956249684,
+            -6.882810939480962
+          ],
+          [
+            107.61151379548716,
+            -6.8828265625120935
+          ],
+          [
+            107.61128415687688,
+            -6.882825420134495
+          ]
+        ],
+        "type": "LineString"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {},
+      "geometry": {
+        "coordinates": [
+          [
+            107.61128434219881,
+            -6.882825614027283
+          ],
+          [
+            107.61126742509839,
+            -6.882940162022933
+          ],
+          [
+            107.61125458920503,
+            -6.882992980359674
+          ],
+          [
+            107.61125119537729,
+            -6.883050253246395
+          ],
+          [
+            107.61125237286109,
+            -6.8831787379445615
+          ],
+          [
+            107.61125197063228,
+            -6.883357229324929
+          ],
+          [
+            107.61125503192596,
+            -6.883620669769243
+          ],
+          [
+            107.61125049196949,
+            -6.883735602543453
+          ],
+          [
+            107.61122526880246,
+            -6.883755776127998
+          ],
+          [
+            107.6110607454184,
+            -6.883528612934455
+          ],
+          [
+            107.61091570909116,
+            -6.883320897579964
+          ],
+          [
+            107.6107771811034,
+            -6.883133484549475
+          ],
+          [
+            107.61072463825911,
+            -6.883067782368258
+          ],
+          [
+            107.61064817454059,
+            -6.882990092463203
+          ],
+          [
+            107.61059846642587,
+            -6.882958477433888
+          ],
+          [
+            107.61060287174757,
+            -6.882948134349945
+          ]
+        ],
+        "type": "LineString"
+      }
+    }
+  ]
+}
+''';
+  }
+
+  List<Location> _parseGeoJson(String geoJsonString) {
+    final List<Location> locations = [];
+    final Map<String, dynamic> geoJson = jsonDecode(geoJsonString);
+
+    for (var feature in geoJson['features']) {
+      final properties = feature['properties'];
+      final coordinates = feature['geometry']['coordinates'];
+
+      if (feature['geometry']['type'] == 'Point') {
+        locations.add(Location(
+          latitude: coordinates[1],
+          longitude: coordinates[0],
+          name: properties['name'] ?? 'Unknown Location',
+        ));
+      }
+      // Handle Polygon or LineString if necessary
+    }
+    return locations;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return Container(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            children: [
+              // Conditional rendering based on minimized state
+              if (!_isMinimized) ...[
+                Expanded(
+                  child: Stack(
+                    children: [
+                      _buildMap(), // Full map view
+                      _buildCompass(_isMinimized),
+                      // Toggle button for minimizing
+                      Positioned(
+                        right: 16,
+                        top: 16,
+                        child: IconButton(
+                          icon: Icon(
+                            _isMinimized
+                                ? LucideIcons.minimize2
+                                : LucideIcons.maximize2,
+                            color: Colors.blueAccent,
+                          ),
+                          onPressed: () {
+                            setState(() {
+                              _isMinimized = !_isMinimized;
+                              widget.onMinimizedChanged(
+                                  _isMinimized); // Notify parent // Toggle the minimized state
+                            });
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 10),
+                _buildLocationInfo(), // Additional info when not minimized
+              ] else ...[
+                Positioned(
+                  left: 16, // Align to the left
+                  top: 16, // Align to the top
+                  child: SizedBox(
+                    height: 200, // Height of minimized state
+                    width: 200, // Width of minimized state
+                    child: Stack(
+                      children: [
+                        _buildMap(), // Only show the map in minimized state
+                        _buildCompass(_isMinimized),
+                        Positioned(
+                          right: 16,
+                          top: 16,
+                          child: IconButton(
+                            icon: Icon(
+                              _isMinimized
+                                  ? LucideIcons.minimize2
+                                  : LucideIcons.maximize2,
+                              color: Colors.blueAccent,
+                            ),
+                            onPressed: () {
+                              setState(() {
+                                _isMinimized = !_isMinimized;
+                                widget.onMinimizedChanged(
+                                    _isMinimized); // Notify parent // Toggle the minimized state
+                              });
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildMap() {
+    return GestureDetector(
+      onPanStart: _onPanStart,
+      onPanUpdate: _onPanUpdate,
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(40),
+          boxShadow: const [
+            BoxShadow(
+              color: Color.fromARGB(255, 56, 156, 160),
+              spreadRadius: 2,
+              blurRadius: 12,
+              offset: Offset(0, 0),
+            ),
+          ],
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(40),
+          child: FlutterMap(
+            mapController: _mapController,
+            options: MapOptions(
+              initialCenter: _currentPosition ??
+                  const LatLng(107.61154761359956, -6.881377969504214),
+              initialZoom: 19.0,
+              initialRotation: _rotation, // Apply rotation to the map
+              onMapReady: _fitMapBounds,
+            ),
+            children: [
+              TileLayer(
+                urlTemplate:
+                    'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+                subdomains: const ['a', 'b', 'c'],
+                tileProvider: NetworkTileProvider(),
+                maxNativeZoom: 20,
+              ),
+              if (_currentPosition != null) _buildCurrentLocationMarker(),
+              if (_destinationLocation != null) _buildDestinationMarker(),
+              if (_polylinePoints.isNotEmpty) _buildRoutePolyline(),
+              RichAttributionWidget(
+                attributions: [
+                  TextSourceAttribution(
+                    'OpenStreet Map contributors',
+                    onTap: () => launchUrl(
+                        Uri.parse('https://openstreetmap.org/copyright')),
+                  ),
+                ],
+              ),
+              if (_isLoading)
+                Center(
+                  child: Container(
+                    width: 60,
+                    height: 60,
+                    decoration: const BoxDecoration(
+                      color: Colors.black54,
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Padding(
+                      padding: EdgeInsets.all(10.0),
+                      child: CircularProgressIndicator(
+                        valueColor:
+                            AlwaysStoppedAnimation<Color>(Colors.blueAccent),
+                        strokeWidth: 4.0,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _onPanStart(DragStartDetails details) {
+    _startOffset = details.localPosition;
+    _startRotation = _rotation;
+  }
+
+  // This is called when the user moves their finger during the pan gesture
+  void _onPanUpdate(DragUpdateDetails details) {
+    if (_startOffset == null) return;
+
+    // Calculate the angle of the rotation
+    final double dx = details.localPosition.dx - _startOffset!.dx;
+    final double dy = details.localPosition.dy - _startOffset!.dy;
+    final double angle = atan2(dy, dx); // Get the angle of the touch movement
+
+    // Update the rotation based on the movement
+    setState(() {
+      _rotation =
+          _startRotation + angle * (180 / pi); // Convert radians to degrees
+      if (_rotation < 0) {
+        _rotation += 360; // Keep rotation within 0 to 360 degrees
+      } else if (_rotation >= 360) {
+        _rotation -= 360;
+      }
+    });
+
+    _mapController.rotate(_rotation); // Apply the rotation to the map
+  }
+
+  MarkerLayer _buildCurrentLocationMarker() {
+    return MarkerLayer(
+      markers: [
+        Marker(
+          width: 50,
+          height: 50,
+          point:
+              LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
+          child: RotatingMarker(
+            child: Image.asset(
+              'assets/images/mevicar.png',
+              width: 50,
+              height: 50,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  MarkerLayer _buildDestinationMarker() {
+    return MarkerLayer(
+      markers: [
+        Marker(
+          width: 50,
+          height: 50,
+          point: _destinationLocation!,
+          child: GestureDetector(
+            onTap: () {
+              _showDestinationInfoDialog(context);
+            },
+            child: ShaderMask(
+              blendMode: BlendMode.srcIn,
+              shaderCallback: (Rect bounds) => const RadialGradient(
+                center: Alignment.topCenter,
+                stops: [.1, 5],
+                colors: [
+                  Color.fromARGB(255, 255, 0, 0),
+                  Color.fromARGB(255, 255, 123, 0),
+                ],
+              ).createShader(bounds),
+              child: const Icon(Icons.location_on_sharp, size: 40),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  PolylineLayer _buildRoutePolyline() {
+    return PolylineLayer(
+      polylines: [
+        Polyline(
+          points: _polylinePoints,
+          strokeWidth: 4.0,
+          color: Colors.blue,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCompass(bool isMinimized) {
+    // Define the size based on the minimized state
+    double compassSize = isMinimized ? 100 : 150; // Smaller size when minimized
+
+    return Positioned(
+      left: 20,
+      top: 20,
+      child: GestureDetector(
+        onPanUpdate: (details) => setState(() {}),
+        child: SizedBox(
+          width: compassSize,
+          height: compassSize,
+          child: InteractiveCompass(
+            destinationLat: widget.destinationLat,
+            destinationLng: widget.destinationLng,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLocationInfo() {
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.grey[900],
+        borderRadius: BorderRadius.circular(40),
+      ),
+      child: Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(10), // Optional padding
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: Colors
+                      .grey[200], // Optional background color behind the image
+                ),
+                child: ClipOval(
+                  child: Image.asset(
+                    'assets/images/mevicar.png', // Path to your uploaded image
+                    width: 40, // Set the width to the desired size
+                    height: 40, // Set the height to the desired size
+                  ),
+                ),
+              ),
+              if (_currentPosition != null)
+                Text(
+                  '${_currentPosition!.longitude.toStringAsFixed(6)}, ${_currentPosition!.latitude.toStringAsFixed(6)}',
+                  style: const TextStyle(color: Colors.white),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              IconButton(
+                onPressed: () {
+                  setState(() {
+                    _isMinBuildInfo =
+                        !_isMinBuildInfo; // Toggle minimized state
+                  });
+                },
+                icon: Icon(
+                  _isMinBuildInfo ? Icons.expand_more : Icons.expand_less,
+                  color: Colors.white,
+                ),
+              ),
+            ],
+          ),
+          if (!_isMinBuildInfo)
+            Column(
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          if (_address != null)
+                            Text(
+                              _address!,
+                              style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.bold),
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          if (_currentPosition == null)
+                            const Text(
+                              "Waiting for location...",
+                              style: TextStyle(color: Colors.white),
+                            ),
+                          const SizedBox(height: 10),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.start,
+                            children: [
+                              Column(
+                                children: [
+                                  const Icon(Icons.drive_eta,
+                                      color: Colors.white),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    _estimatedDistance != null
+                                        ? ' ${_estimatedDistance!.toStringAsFixed(2)} km'
+                                        : ' - km',
+                                    style: const TextStyle(
+                                        color: Colors.white, fontSize: 14),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(width: 20),
+                              Column(
+                                children: [
+                                  const Icon(Icons.access_time,
+                                      color: Colors.white),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    _estimatedTime != null
+                                        ? ' $_estimatedTime'
+                                        : '- min',
+                                    style: const TextStyle(
+                                        color: Colors.white, fontSize: 14),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    Column(
+                      children: [
+                        Container(
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: ElevatedButton(
+                              onPressed: _updateLocation,
+                              child: const Icon(Icons.refresh_rounded)),
+                        ),
+                        const SizedBox(height: 10),
+                        ElevatedButton(
+                          onPressed: () => _searchDestination(context),
+                          child: const Icon(Icons.search),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+
+  Future<Location?> _searchDestination(BuildContext context) async {
+    List<Location> searchResults = [];
+    Location? selectedLocation;
+
+    await showDialog<Location?>(
+      context: context,
+      builder: (context) {
+        final TextEditingController searchController = TextEditingController();
+
+        return StatefulBuilder(
+          builder: (context, setState) {
+            return AlertDialog(
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16.0), // Rounded corners
+              ),
+              title: const Text(
+                'Search Destination',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              content: SizedBox(
+                height: 400,
+                width: 300,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextField(
+                      controller: searchController,
+                      decoration: InputDecoration(
+                        labelText: 'Enter destination',
+                        border: OutlineInputBorder(
+                          borderRadius:
+                              BorderRadius.circular(12.0), // Rounded corners
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderSide:
+                              const BorderSide(color: Colors.blue, width: 2.0),
+                          borderRadius: BorderRadius.circular(12.0),
+                        ),
+                        contentPadding: const EdgeInsets.symmetric(
+                            vertical: 12, horizontal: 16),
+                      ),
+                      onChanged: (value) async {
+                        if (value.isNotEmpty) {
+                          try {
+                            // Fetch locations from Mapbox
+                            final results = await _locationService
+                                .fetchLocationsFromMapbox(value);
+                            setState(() {
+                              searchResults = results.cast<Location>();
+                            });
+
+                            // Filter GeoJSON locations based on the search query
+                            final geoJsonMatches =
+                                _geoJsonLocations.where((location) {
+                              return location.name
+                                  .toLowerCase()
+                                  .contains(value.toLowerCase());
+                            }).toList();
+
+                            // Combine Mapbox results and GeoJSON matches
+                            setState(() {
+                              searchResults.addAll(geoJsonMatches);
+                            });
+                          } catch (e) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                  content:
+                                      Text("Error fetching locations: $e")),
+                            );
+                          }
+                        } else {
+                          setState(() {
+                            searchResults = [];
+                          });
+                        }
+                      },
+                    ),
+                    const SizedBox(height: 10),
+                    Expanded(
+                      child: searchResults.isEmpty
+                          ? const Center(child: Text('No results found'))
+                          : ListView.builder(
+                              itemCount: searchResults.length,
+                              itemBuilder: (context, index) {
+                                final location = searchResults[index];
+                                return Card(
+                                  // Add a card for better visual separation
+                                  margin:
+                                      const EdgeInsets.symmetric(vertical: 4.0),
+                                  child: ListTile(
+                                    leading: const Icon(Icons.location_on,
+                                        color: Colors.blue), // Add an icon
+                                    title: Text(
+                                      '${location.latitude}, ${location.longitude}',
+                                      style: const TextStyle(
+                                          fontWeight: FontWeight.bold),
+                                    ),
+                                    subtitle: Text(location.name),
+                                    onTap: () {
+                                      selectedLocation = location;
+                                      Navigator.of(context).pop(
+                                          location); // Close dialog and return location
+                                      _selectLocation(context,
+                                          location); // Call selectLocation with the selected location
+                                    },
+                                  ),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.red, // Button color
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(
+                          12.0), // Rounded corners for button
+                    ),
+                  ),
+                  onPressed: () {
+                    Navigator.of(context).pop(); // Close dialog
+                    searchController.dispose(); // Dispose the controller here
+                  },
+                  child: const Text('Cancel'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    return selectedLocation; // Return the selected location
+  }
+
+  void _selectLocation(BuildContext context, Location selectedLocation) async {
+    setState(() {
+      _destinationLocation =
+          LatLng(selectedLocation.latitude, selectedLocation.longitude);
+    });
+
+    rosService.publishDestinationCoordinates(
+        selectedLocation.latitude, selectedLocation.longitude);
+    if (_currentPosition != null) {
+      try {
+        setState(() => _isLoading = true);
+
+        // Check if the selected location is from GeoJSON
+        bool isGeoJsonLocation = _geoJsonLocations.any((loc) =>
+            loc.latitude == selectedLocation.latitude &&
+            loc.longitude == selectedLocation.longitude);
+
+        List<LatLng> routePoints;
+        if (isGeoJsonLocation) {
+          await _getRouteFromGeoJson(_destinationLocation!);
+        } else {
+          routePoints = await _externalRouteManager.getExternalRoute(
+              LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
+              _destinationLocation!);
+
+          if (routePoints.isNotEmpty) {
+            setState(() {
+              _polylinePoints = routePoints;
+              _estimatedDistance = _calculateTotalDistance(routePoints);
+              _estimatedTime = _formatTravelTime(_estimatedDistance! / 30);
+            });
+            _fitMapBounds();
+          }
+        }
+
+        _showLocationDialog(selectedLocation);
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Error getting route: $e")),
+        );
+      } finally {
+        setState(() => _isLoading = false);
+      }
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Current location is not available")),
+      );
+    }
+  }
+
+  void _showLocationDialog(Location location) {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16.0), // Rounded corners
+          ),
+          title: const Text(
+            'Selected Location',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24),
+          ),
+          content: SingleChildScrollView(
+            child: Padding(
+              padding: const EdgeInsets.all(16.0), // Consistent padding
+              child: Column(
+                mainAxisSize: MainAxisSize.min, // Use minimum size for dialog
+                children: [
+                  Text(
+                    location.name,
+                    style: const TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.blueAccent, // Highlight the location name
+                    ),
+                  ),
+                  const SizedBox(height: 8), // Space between elements
+                  Text(
+                    'Location: ${location.latitude}, ${location.longitude}',
+                    style: const TextStyle(fontSize: 16, color: Colors.grey),
+                  ),
+                  const SizedBox(height: 12), // Space before the button
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.blue, // Button color
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(
+                            12.0), // Rounded corners for button
+                      ),
+                    ),
+                    onPressed: () {
+                      Navigator.of(context).pop(); // Close dialog
+                    },
+                    child: const Text('OK'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _updateLocation() async {
+    try {
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        throw LocationServiceException('Location services not detection');
+      }
+
+      Position position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+        timeLimit: const Duration(seconds: 5),
+      );
+
+      // Periksa akurasi lokasi
+      if (position.accuracy > 20) {
+        _showLocationAccuracyWarning();
+      }
+
+      LatLng newPosition = LatLng(position.latitude, position.longitude);
+
+      // Periksa perubahan posisi yang signifikan (misalnya lebih dari 5 meter)
+      if (_lastPosition == null ||
+          Geolocator.distanceBetween(
+                _lastPosition!.latitude,
+                _lastPosition!.longitude,
+                newPosition.latitude,
+                newPosition.longitude,
+              ) >
+              5) {
+        setState(() {
+          _currentPosition = newPosition;
+          _lastPosition = newPosition; // Update posisi terakhir
+        });
+
+        String? address =
+            await _locationService.getAddressFromCoordinates(position);
+        if (address != null) {
+          setState(() {
+            _address = address;
+          });
+        }
+
+        // Perbarui rute jika tujuan ada dan posisi berubah signifikan
+        if (_destinationLocation != null) {
+          await _getRouteFromGeoJson(_destinationLocation!);
+        }
+
+        _mapController.move(_currentPosition!, _mapController.camera.zoom);
+      }
+    } on LocationServiceException catch (e) {
+      _showLocationServiceError(e.message);
+    } on PermissionDeniedException {
+      _showPermissionDeniedError();
+    } on TimeoutException {
+      _showTimeoutError();
+    } catch (e) {
+      _showGenericError(e.toString());
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  void _showLocationAccuracyWarning() {
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('GPS signal is weak. Location may be less accurate.'),
+        duration: Duration(seconds: 3),
+        backgroundColor: Colors.orange,
+      ),
+    );
+  }
+
+  void _showLocationServiceError(String message) {
+    if (!mounted) return;
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Location Services Disabled'),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              Geolocator.openLocationSettings();
+            },
+            child: const Text('Open Settings'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showPermissionDeniedError() {
+    if (!mounted) return;
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Location Permission Required'),
+        content: const Text(
+            'This app needs location permission to show your current position on the map.'),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              Geolocator.openAppSettings();
+            },
+            child: const Text('Open App Settings'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showTimeoutError() {
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Location request timed out. Please try again.'),
+        duration: Duration(seconds: 3),
+        backgroundColor: Colors.red,
+      ),
+    );
+  }
+
+  void _showGenericError(String error) {
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Error updating location: $error'),
+        duration: const Duration(seconds: 3),
+        backgroundColor: Colors.red,
+      ),
+    );
+  }
+}
+
+class LocationServiceException implements Exception {
+  final String message;
+  LocationServiceException(this.message);
+}
